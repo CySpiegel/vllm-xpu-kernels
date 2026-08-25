@@ -3,10 +3,14 @@
 
 Differential test: a single mixed-batch invocation must be bitwise identical
 to chaining the two single-population invocations (each independently
-validated against python references by test_gdn_attn.py) on cloned states.
-This is exactly the composition property the fused entry point's mixed branch
-implements; before that branch existed, mixed batches were rejected outright
-(the crash seen in vLLM under concurrent MTP serving).
+validated against python references by test_gdn_attn.py) on cloned states —
+including with fully shuffled token index sets and regardless of allocator
+history. Historically this test exposed, in order: the mixed-batch rejection
+(engine crash under concurrent MTP), uninitialized spec intermediates, and
+the XE2 delta epilogue's undocumented assumption that token_indx values are
+chunk-contiguous (single lookup + block write, corrupting neighboring rows /
+overrunning the tensor for arbitrary index sets — fixed via compact staging
++ per-row scatter in the interface).
 """
 
 import os
@@ -139,26 +143,7 @@ def test_gdn_attention_mixed_batch(num_prefills, num_decodes,
     out_m, z_m, conv_m, ssm_m = run("mixed")
     out_s, z_s, conv_s, ssm_s = run("sequential")
 
-    # Rejected speculative positions are dead outputs (the engine discards
-    # them); the kernels are permitted to leave allocator-dependent noise
-    # there (tracked upstream as an OOB-read hardening item). All LIVE rows
-    # and all persistent state must be bitwise identical.
-    acc_list = num_accepted_tokens.cpu().tolist()
-    spec_pos = spec_token_indx.cpu().tolist()
-    rejected = [spec_pos[s * K + k] for s in range(num_spec_decodes)
-                for k in range(K) if k >= acc_list[s]]
-    # CPU-side masking: XPU boolean indexing routes through the platform's
-    # broken nonzero (drops elements / device-asserts).
-    live = torch.ones(num_actual_tokens, dtype=torch.bool)
-    if rejected:
-        live[torch.tensor(rejected, dtype=torch.long)] = False
-
-    om, os_ = out_m.cpu(), out_s.cpu()
-    if not torch.equal(om[live], os_[live]):
-        dr = (om != os_).any(dim=(1, 2)).nonzero().flatten().tolist()
-        raise AssertionError(
-            f"live rows differ: diff_rows={dr} rejected={sorted(rejected)} "
-            f"spec_pos={spec_pos} accepted={acc_list} N={num_actual_tokens}")
-    assert torch.equal(z_m.cpu()[live], z_s.cpu()[live]), "live z rows differ"
+    assert torch.equal(out_m, out_s), "core_attn_out differs (STRICT)"
+    assert torch.equal(z_m, z_s), "z differs (STRICT)"
     assert torch.equal(conv_m, conv_s), "conv_state differs from composition"
     assert torch.equal(ssm_m, ssm_s), "ssm_state differs from composition"
