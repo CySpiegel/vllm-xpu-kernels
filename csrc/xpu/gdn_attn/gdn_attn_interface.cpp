@@ -207,7 +207,10 @@ std::vector<torch::Tensor> causal_conv1d(
   }
 
   TORCH_CHECK(spec_token == num_spec_decodes * (num_speculative_tokens + 1));
-  TORCH_CHECK(non_spec_token + spec_token == num_actual_tokens);
+  // <= (not ==): a mixed-batch gdn_attention call chains one sub-call per
+  // population; each covers a subset of num_actual_tokens. Full coverage is
+  // enforced by the fused entry point.
+  TORCH_CHECK(non_spec_token + spec_token <= num_actual_tokens);
 
   TORCH_CHECK(
       z.size(0) >= num_actual_tokens,
@@ -267,19 +270,19 @@ std::vector<torch::Tensor> causal_conv1d(
   std::vector<torch::Tensor> intermediates;
 
   if (spec_token > 0) {
-    torch::Tensor q = torch::empty(
+    torch::Tensor q = torch::zeros(
         {spec_token, num_k_heads / tp_size, head_k_dim},
         torch::dtype(dtype).device(device).requires_grad(false));
-    torch::Tensor k = torch::empty(
+    torch::Tensor k = torch::zeros(
         {spec_token, num_k_heads / tp_size, head_k_dim},
         torch::dtype(dtype).device(device).requires_grad(false));
-    torch::Tensor v = torch::empty(
+    torch::Tensor v = torch::zeros(
         {spec_token, num_v_heads / tp_size, head_v_dim},
         torch::dtype(dtype).device(device).requires_grad(false));
-    torch::Tensor b = torch::empty(
+    torch::Tensor b = torch::zeros(
         {spec_token, num_v_heads / tp_size},
         torch::dtype(dtype).device(device).requires_grad(false));
-    torch::Tensor a = torch::empty(
+    torch::Tensor a = torch::zeros(
         {spec_token, num_v_heads / tp_size},
         torch::dtype(dtype).device(device).requires_grad(false));
 
@@ -557,8 +560,10 @@ void gated_delta_rule(
   }
 
   TORCH_CHECK(
-      non_spec_token + spec_token == num_actual_tokens,
-      "non_spec_token + spec_token must equal num_actual_tokens");
+      non_spec_token + spec_token <= num_actual_tokens,
+      "non_spec_token + spec_token must not exceed num_actual_tokens "
+      "(mixed-batch sub-calls cover a subset each; full coverage is enforced "
+      "by the fused entry point)");
 
   // Narrow the (possibly cudagraph-padded) leading dim to the active prefix.
   auto core_attn_out_active = core_attn_out.narrow(0, 0, num_actual_tokens);
@@ -658,13 +663,15 @@ void gated_delta_rule(
   }
 }
 
-// Legacy fused entry point kept for API backward compatibility. It performs
-// the exact same work as the original gdn_attention by chaining the two split
-// ops: causal_conv1d produces the {q,k,v,b,a} intermediates (and writes z /
-// updates conv_state); gated_delta_rule consumes them (and writes
-// core_attn_out / updates ssm_state). causal_conv1d enforces that the
-// spec-decode and non-spec paths are mutually exclusive, so it returns a
-// single 5-tensor group here, preserving the original fused-op semantics.
+// Fused entry point. Chains the two split ops: causal_conv1d produces the
+// {q,k,v,b,a} intermediates (and writes z / updates conv_state);
+// gated_delta_rule consumes them (and writes core_attn_out / updates
+// ssm_state). A single causal_conv1d invocation handles one population
+// (spec-decode OR non-spec); mixed batches are handled here by chaining one
+// single-population conv+delta pipeline per population — valid because the
+// kernels gather inputs and scatter z/core_attn_out at global token positions
+// via token_indx, and the populations are disjoint in both token rows and
+// conv/ssm state slots.
 void gdn_attention(
     torch::Tensor& core_attn_out,
     torch::Tensor& z,
@@ -695,6 +702,57 @@ void gdn_attention(
     const int64_t num_actual_tokens,
     const int64_t tp_size,
     const bool reorder_input) {
+  const bool mixed_batch =
+      num_spec_decodes > 0 && num_prefills + num_decodes > 0;
+  if (mixed_batch) {
+    // Mixed spec-decode + non-spec batch: chain one single-population
+    // conv+delta pipeline per population. The conv kernels gather their
+    // population's rows from the full input via token_indx and scatter z at
+    // global token positions, and the two populations touch disjoint token
+    // rows and state slots, so the two pipelines compose exactly.
+    TORCH_CHECK(
+        non_spec_token_indx.has_value() && spec_token_indx.has_value(),
+        "mixed spec/non-spec batches require both token index tensors");
+    TORCH_CHECK(
+        non_spec_token_indx->size(0) + spec_token_indx->size(0) ==
+            num_actual_tokens,
+        "mixed batch token indices must cover num_actual_tokens exactly");
+    std::optional<torch::Tensor> none{std::nullopt};
+
+    std::vector<torch::Tensor> non_spec_im = causal_conv1d(
+        z, projected_states_qkvz, projected_states_ba, num_k_heads,
+        num_v_heads, head_k_dim, head_v_dim, conv_state, conv_weights,
+        conv_bias, activation, num_prefills, num_decodes,
+        /*num_spec_decodes=*/0, has_initial_state, non_spec_query_start_loc,
+        non_spec_token_indx, non_spec_state_indices_tensor, none, none, none,
+        none, num_actual_tokens, tp_size, reorder_input);
+    TORCH_CHECK(non_spec_im.size() == 5);
+    gated_delta_rule(
+        core_attn_out, non_spec_im[0], non_spec_im[1], non_spec_im[2],
+        non_spec_im[3], non_spec_im[4], num_v_heads, head_v_dim, A_log,
+        dt_bias, ssm_state, num_prefills, num_decodes, /*num_spec_decodes=*/0,
+        has_initial_state, non_spec_query_start_loc, non_spec_token_indx,
+        non_spec_state_indices_tensor, none, none, none, none,
+        num_actual_tokens, tp_size);
+
+    std::vector<torch::Tensor> spec_im = causal_conv1d(
+        z, projected_states_qkvz, projected_states_ba, num_k_heads,
+        num_v_heads, head_k_dim, head_v_dim, conv_state, conv_weights,
+        conv_bias, activation, /*num_prefills=*/0, /*num_decodes=*/0,
+        num_spec_decodes, none, none, none, none, spec_query_start_loc,
+        spec_token_indx, spec_state_indices_tensor, num_accepted_tokens,
+        num_actual_tokens, tp_size, reorder_input);
+    TORCH_CHECK(spec_im.size() == 5);
+    gated_delta_rule(
+        core_attn_out, spec_im[0], spec_im[1], spec_im[2], spec_im[3],
+        spec_im[4], num_v_heads, head_v_dim, A_log, dt_bias, ssm_state,
+        /*num_prefills=*/0, /*num_decodes=*/0, num_spec_decodes, none, none,
+        none, none, spec_query_start_loc, spec_token_indx,
+        spec_state_indices_tensor, num_accepted_tokens, num_actual_tokens,
+        tp_size);
+    return;
+  }
+
   std::vector<torch::Tensor> intermediates = causal_conv1d(
       z,
       projected_states_qkvz,
