@@ -66,8 +66,10 @@ def test_gdn_attention_mixed_batch(num_prefills, num_decodes,
                         device=device)
     dt_bias = torch.randn(num_v_heads // tp_size, dtype=dtype, device=device)
 
-    conv_state0 = torch.randn(cache_batch_size, width - 1, mixed_qkv_size,
-                              dtype=dtype, device=device)
+    # Sliding-window conv-state convention (upstream #544/#545): the spec path
+    # needs width - 1 history rows plus K - 1 draft rows per cache line.
+    conv_state0 = torch.randn(cache_batch_size, width - 1 + (K - 1),
+                              mixed_qkv_size, dtype=dtype, device=device)
     ssm_state0 = torch.randn(cache_batch_size, num_v_heads // tp_size,
                              head_v_dim, head_k_dim, dtype=ssm_state_dtype,
                              device=device)
@@ -92,8 +94,10 @@ def test_gdn_attention_mixed_batch(num_prefills, num_decodes,
     spec_state_indices_tensor = torch.tensor(
         slots[len(non_spec_lens):], dtype=torch.int32,
         device=device).reshape(num_spec_decodes, K)
+    # The engine always accepts at least the bonus token; the sliding-window
+    # kernel indexes row num_accepted - 1, so 0 is out of contract.
     num_accepted_tokens = torch.tensor(
-        [random.randint(0, K) for _ in range(num_spec_decodes)],
+        [random.randint(1, K) for _ in range(num_spec_decodes)],
         dtype=torch.int32, device=device)
     spec_query_start_loc = (torch.arange(
         num_spec_decodes + 1, dtype=torch.int32, device=device) * K)
